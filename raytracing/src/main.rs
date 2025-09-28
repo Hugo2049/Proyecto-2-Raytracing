@@ -195,7 +195,7 @@ pub fn cast_ray(
     )
 }
 
-// Adaptive rendering based on camera movement
+// Adaptive rendering with improved boundary handling
 pub fn render_adaptive(
     framebuffer: &mut Framebuffer, 
     objects: &mut [Cube], 
@@ -203,26 +203,25 @@ pub fn render_adaptive(
     light: &Light,
     render_scale: f32,
 ) {
-    let width = framebuffer.width as f32;
-    let height = framebuffer.height as f32;
-    let aspect_ratio = width / height;
+    let width = framebuffer.width;
+    let height = framebuffer.height;
+    let aspect_ratio = width as f32 / height as f32;
     let fov = PI / 3.0;
     let perspective_scale = (fov * 0.5).tan();
 
-    let render_width = (width * render_scale) as u32;
-    let render_height = (height * render_scale) as u32;
+    // Ensure minimum render size to prevent division issues
+    let render_width = ((width as f32 * render_scale) as u32).max(1);
+    let render_height = ((height as f32 * render_scale) as u32).max(1);
     
-    let step_x = framebuffer.width / render_width;
-    let step_y = framebuffer.height / render_height;
+    // Calculate step sizes with proper bounds
+    let step_x = if render_width > 0 { width / render_width } else { 1 };
+    let step_y = if render_height > 0 { height / render_height } else { 1 };
 
-    // Single-threaded rendering (no parallel processing due to Raylib limitations)
+    // Render at lower resolution first
     for y in 0..render_height {
         for x in 0..render_width {
-            let actual_x = x * step_x;
-            let actual_y = y * step_y;
-            
-            let screen_x = (2.0 * actual_x as f32) / width - 1.0;
-            let screen_y = -(2.0 * actual_y as f32) / height + 1.0;
+            let screen_x = (2.0 * (x * step_x) as f32) / width as f32 - 1.0;
+            let screen_y = -(2.0 * (y * step_y) as f32) / height as f32 + 1.0;
             let screen_x = screen_x * aspect_ratio * perspective_scale;
             let screen_y = screen_y * perspective_scale;
 
@@ -234,21 +233,28 @@ pub fn render_adaptive(
 
             framebuffer.set_current_color(pixel_color);
             
-            // Fill block if downscaled for better visual quality
-            for dy in 0..step_y {
-                for dx in 0..step_x {
-                    framebuffer.set_pixel(actual_x + dx, actual_y + dy);
+            // Fill the corresponding block in the framebuffer
+            let start_x = x * step_x;
+            let start_y = y * step_y;
+            let end_x = ((x + 1) * step_x).min(width);
+            let end_y = ((y + 1) * step_y).min(height);
+            
+            for pixel_y in start_y..end_y {
+                for pixel_x in start_x..end_x {
+                    framebuffer.set_pixel(pixel_x, pixel_y);
                 }
             }
         }
     }
 }
 
-// Create complete diorama with FULL borders
+// Create complete diorama with trees
 fn create_diorama(
     piedra_texture: Image, 
     diamante_texture: Option<Image>, 
-    tierra_texture: Option<Image>
+    tierra_texture: Option<Image>,
+    tronco_texture: Option<Image>,
+    hojas_texture: Option<Image>
 ) -> Vec<Cube> {
     let mut cubes = Vec::new();
     let cube_size = 1.0;
@@ -275,6 +281,20 @@ fn create_diorama(
         Vector3::new(0.6, 0.4, 0.2),
         16.0,
         [0.9, 0.1, 0.0, 0.0],
+        1.0,
+    );
+
+    let tronco_material = Material::new(
+        Vector3::new(0.5, 0.3, 0.2),
+        16.0,
+        [0.9, 0.1, 0.0, 0.0],
+        1.0,
+    );
+
+    let hojas_material = Material::new(
+        Vector3::new(0.2, 0.7, 0.2),
+        8.0,
+        [0.8, 0.2, 0.0, 0.0],
         1.0,
     );
     
@@ -396,6 +416,80 @@ fn create_diorama(
         println!("TOP FLOOR: {} tierra cubes with complete borders", 
                  (floor_size * floor_size) - (4 * 3));
     }
+
+    // 4. ADD MINECRAFT-STYLE TREES on top floor
+    if let (Some(tronco_tex), Some(hojas_tex)) = (tronco_texture, hojas_texture) {
+        let top_y = cube_size / 2.0 + wall_height as f32 * cube_size;
+        
+        // Tree positions - 3 trees around the hole
+        let tree_positions = vec![
+            (1, 1),  // Front-left of the diorama
+            (8, 2),  // Front-right 
+            (2, 8),  // Back-left
+        ];
+        
+        for (tree_x, tree_z) in tree_positions {
+            let tree_world_x = start_offset + tree_x as f32 * cube_size;
+            let tree_world_z = start_offset + tree_z as f32 * cube_size;
+            
+            // TRUNK - 3 cubes tall (raised higher so it's visible)
+            for trunk_height in 0..3 {
+                let trunk_y = top_y + cube_size + trunk_height as f32 * cube_size;
+                
+                cubes.push(Cube::with_texture(
+                    Vector3::new(tree_world_x, trunk_y, tree_world_z),
+                    cube_size,
+                    tronco_material,
+                    tronco_tex.clone(),
+                ));
+            }
+            
+            // LEAVES - Start at top of trunk, raised higher
+            let leaves_center_y = top_y + cube_size + 2.0 * cube_size; // Top of 3-block trunk
+            
+            // 3x3 leaves pattern for 2 layers only (middle and top) - no bottom layer
+            for dy in 1..3 { // Start from layer 1, not 0
+                for dx in -1i32..=1i32 {
+                    for dz in -1i32..=1i32 {
+                        let leaf_x = tree_world_x + dx as f32 * cube_size;
+                        let leaf_y = leaves_center_y + (dy as f32 - 1.0) * cube_size;
+                        let leaf_z = tree_world_z + dz as f32 * cube_size;
+                        
+                        // Create a more natural tree shape - fewer leaves on edges
+                        let is_edge = dx.abs() == 1 && dz.abs() == 1;
+                        let is_top_layer = dy == 2;
+                        let is_center = dx == 0 && dz == 0;
+                        
+                        // Skip top corners for natural look
+                        if is_edge && is_top_layer && !is_center {
+                            continue; 
+                        }
+                        
+                        cubes.push(Cube::with_texture(
+                            Vector3::new(leaf_x, leaf_y, leaf_z),
+                            cube_size,
+                            hojas_material,
+                            hojas_tex.clone(),
+                        ));
+                    }
+                }
+            }
+            
+            // Add a single crown leaf on top of the tree
+            let crown_y = leaves_center_y + 1.0 * cube_size;
+            cubes.push(Cube::with_texture(
+                Vector3::new(tree_world_x, crown_y, tree_world_z),
+                cube_size,
+                hojas_material,
+                hojas_tex.clone(),
+            ));
+        }
+        
+        println!("TREES: Added 3 Minecraft-style trees with elevated canopy");
+        println!("Each tree: 3 trunk cubes + ~15 leaf cubes + 1 crown");
+    } else {
+        println!("TREES: Tronco or Hojas texture not found - skipping trees");
+    }
     
     println!("TOTAL CUBES: {}", cubes.len());
     cubes
@@ -417,6 +511,8 @@ fn main() {
     let piedra_paths = ["src/assets/Piedra.png", "./src/assets/Piedra.png", "./assets/Piedra.png"];
     let diamante_paths = ["src/assets/Diamante.png", "./src/assets/Diamante.png", "./assets/Diamante.png"];
     let tierra_paths = ["src/assets/Tierra.png", "./src/assets/Tierra.png", "./assets/Tierra.png"];
+    let tronco_paths = ["src/assets/Tronco.png", "./src/assets/Tronco.png", "./assets/Tronco.png"];
+    let hojas_paths = ["src/assets/Hojas.png", "./src/assets/Hojas.png", "./assets/Hojas.png"];
 
     let mut piedra_texture = None;
     for path in &piedra_paths {
@@ -445,8 +541,26 @@ fn main() {
         }
     }
 
+    let mut tronco_texture = None;
+    for path in &tronco_paths {
+        if let Ok(image) = Image::load_image(path) {
+            println!("Loaded Tronco from: {}", path);
+            tronco_texture = Some(image);
+            break;
+        }
+    }
+
+    let mut hojas_texture = None;
+    for path in &hojas_paths {
+        if let Ok(image) = Image::load_image(path) {
+            println!("Loaded Hojas from: {}", path);
+            hojas_texture = Some(image);
+            break;
+        }
+    }
+
     let mut objects = if let Some(piedra) = piedra_texture {
-        create_diorama(piedra, diamante_texture, tierra_texture)
+        create_diorama(piedra, diamante_texture, tierra_texture, tronco_texture, hojas_texture)
     } else {
         println!("ERROR: Could not load Piedra texture!");
         vec![]
