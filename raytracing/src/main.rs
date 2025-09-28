@@ -195,7 +195,7 @@ pub fn cast_ray(
     )
 }
 
-// Adaptive rendering with improved boundary handling
+// Fixed adaptive rendering with proper black screen elimination
 pub fn render_adaptive(
     framebuffer: &mut Framebuffer, 
     objects: &mut [Cube], 
@@ -209,39 +209,118 @@ pub fn render_adaptive(
     let fov = PI / 3.0;
     let perspective_scale = (fov * 0.5).tan();
 
-    // Ensure minimum render size to prevent division issues
-    let render_width = ((width as f32 * render_scale) as u32).max(1);
-    let render_height = ((height as f32 * render_scale) as u32).max(1);
-    
-    // Calculate step sizes with proper bounds
-    let step_x = if render_width > 0 { width / render_width } else { 1 };
-    let step_y = if render_height > 0 { height / render_height } else { 1 };
+    // Ensure minimum render size and handle edge cases
+    let render_width = ((width as f32 * render_scale).round() as u32).max(1).min(width);
+    let render_height = ((height as f32 * render_scale).round() as u32).max(1).min(height);
 
-    // Render at lower resolution first
-    for y in 0..render_height {
-        for x in 0..render_width {
-            let screen_x = (2.0 * (x * step_x) as f32) / width as f32 - 1.0;
-            let screen_y = -(2.0 * (y * step_y) as f32) / height as f32 + 1.0;
-            let screen_x = screen_x * aspect_ratio * perspective_scale;
-            let screen_y = screen_y * perspective_scale;
+    // If render scale is close to 1.0, just render at full resolution
+    if render_scale >= 0.95 {
+        // Full resolution rendering
+        for y in 0..height {
+            for x in 0..width {
+                let screen_x = (2.0 * x as f32) / width as f32 - 1.0;
+                let screen_y = -(2.0 * y as f32) / height as f32 + 1.0;
+                let screen_x = screen_x * aspect_ratio * perspective_scale;
+                let screen_y = screen_y * perspective_scale;
 
-            let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
-            let rotated_direction = camera.basis_change(&ray_direction);
+                let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
+                let rotated_direction = camera.basis_change(&ray_direction);
 
-            let pixel_color_v3 = cast_ray(&camera.eye, &rotated_direction, objects, light, 0, camera, fov, aspect_ratio);
-            let pixel_color = vector3_to_color(pixel_color_v3);
+                let pixel_color_v3 = cast_ray(&camera.eye, &rotated_direction, objects, light, 0, camera, fov, aspect_ratio);
+                let pixel_color = vector3_to_color(pixel_color_v3);
 
-            framebuffer.set_current_color(pixel_color);
-            
-            // Fill the corresponding block in the framebuffer
-            let start_x = x * step_x;
-            let start_y = y * step_y;
-            let end_x = ((x + 1) * step_x).min(width);
-            let end_y = ((y + 1) * step_y).min(height);
-            
-            for pixel_y in start_y..end_y {
-                for pixel_x in start_x..end_x {
-                    framebuffer.set_pixel(pixel_x, pixel_y);
+                framebuffer.set_current_color(pixel_color);
+                framebuffer.set_pixel(x, y);
+            }
+        }
+    } else {
+        // Lower resolution rendering with proper upscaling
+        let step_x = (width as f32 / render_width as f32).ceil() as u32;
+        let step_y = (height as f32 / render_height as f32).ceil() as u32;
+
+        for y in 0..render_height {
+            for x in 0..render_width {
+                // Calculate the center of the block we're rendering
+                let center_x = (x * step_x) + step_x / 2;
+                let center_y = (y * step_y) + step_y / 2;
+                
+                let screen_x = (2.0 * center_x as f32) / width as f32 - 1.0;
+                let screen_y = -(2.0 * center_y as f32) / height as f32 + 1.0;
+                let screen_x = screen_x * aspect_ratio * perspective_scale;
+                let screen_y = screen_y * perspective_scale;
+
+                let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
+                let rotated_direction = camera.basis_change(&ray_direction);
+
+                let pixel_color_v3 = cast_ray(&camera.eye, &rotated_direction, objects, light, 0, camera, fov, aspect_ratio);
+                let pixel_color = vector3_to_color(pixel_color_v3);
+
+                framebuffer.set_current_color(pixel_color);
+                
+                // Fill the entire block, ensuring we cover all pixels
+                let start_x = x * step_x;
+                let start_y = y * step_y;
+                let end_x = ((x + 1) * step_x).min(width);
+                let end_y = ((y + 1) * step_y).min(height);
+                
+                for pixel_y in start_y..end_y {
+                    for pixel_x in start_x..end_x {
+                        framebuffer.set_pixel(pixel_x, pixel_y);
+                    }
+                }
+            }
+        }
+        
+        // Fill any remaining pixels if there are gaps due to rounding
+        let last_rendered_x = render_width * step_x;
+        let last_rendered_y = render_height * step_y;
+        
+        // Fill remaining right edge
+        if last_rendered_x < width {
+            // Use the last column's color
+            if render_width > 0 {
+                let last_col_x = (render_width - 1) * step_x;
+                let last_col_y = 0;
+                let screen_x = (2.0 * last_col_x as f32) / width as f32 - 1.0;
+                let screen_y = -(2.0 * last_col_y as f32) / height as f32 + 1.0;
+                let screen_x = screen_x * aspect_ratio * perspective_scale;
+                let screen_y = screen_y * perspective_scale;
+
+                let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
+                let rotated_direction = camera.basis_change(&ray_direction);
+                let pixel_color_v3 = cast_ray(&camera.eye, &rotated_direction, objects, light, 0, camera, fov, aspect_ratio);
+                let pixel_color = vector3_to_color(pixel_color_v3);
+                framebuffer.set_current_color(pixel_color);
+                
+                for y in 0..height {
+                    for x in last_rendered_x..width {
+                        framebuffer.set_pixel(x, y);
+                    }
+                }
+            }
+        }
+        
+        // Fill remaining bottom edge
+        if last_rendered_y < height {
+            // Use the last row's color
+            if render_height > 0 {
+                let last_row_x = 0;
+                let last_row_y = (render_height - 1) * step_y;
+                let screen_x = (2.0 * last_row_x as f32) / width as f32 - 1.0;
+                let screen_y = -(2.0 * last_row_y as f32) / height as f32 + 1.0;
+                let screen_x = screen_x * aspect_ratio * perspective_scale;
+                let screen_y = screen_y * perspective_scale;
+
+                let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
+                let rotated_direction = camera.basis_change(&ray_direction);
+                let pixel_color_v3 = cast_ray(&camera.eye, &rotated_direction, objects, light, 0, camera, fov, aspect_ratio);
+                let pixel_color = vector3_to_color(pixel_color_v3);
+                framebuffer.set_current_color(pixel_color);
+                
+                for y in last_rendered_y..height {
+                    for x in 0..last_rendered_x {
+                        framebuffer.set_pixel(x, y);
+                    }
                 }
             }
         }
@@ -566,10 +645,10 @@ fn main() {
         vec![]
     };
 
-    // Camera positioned to see the cave clearly
+    // Camera positioned in front of the diorama for better initial view
     let mut camera = Camera::new(
-        Vector3::new(-6.0, 6.0, -6.0),
-        Vector3::new(0.0, 2.0, 0.0),
+        Vector3::new(0.0, 4.0, -12.0),  // Front view, slightly elevated
+        Vector3::new(0.0, 3.0, 0.0),    // Looking at center of scene
         Vector3::new(0.0, 1.0, 0.0),
     );
 
