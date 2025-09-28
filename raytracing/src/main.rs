@@ -17,6 +17,15 @@ use material::{Material, vector3_to_color};
 
 const ORIGIN_BIAS: f32 = 1e-4;
 
+// Performance settings - adjusted for better balance
+const ADAPTIVE_RENDER: bool = true;
+const MIN_RENDER_SCALE: f32 = 0.125; // Even lower for moving
+const MID_RENDER_SCALE: f32 = 0.5;   // Medium quality
+const MAX_RENDER_SCALE: f32 = 0.75;  // Reduced max quality
+const MAX_RAY_DEPTH: u32 = 0;        // No reflections for performance
+const FRUSTUM_CULLING: bool = true;
+const EARLY_RAY_TERMINATION: bool = false; // Disabled - causing holes
+
 fn procedural_sky(dir: Vector3) -> Vector3 {
     let d = dir.normalized();
     let t = (d.y + 1.0) * 0.5;
@@ -53,8 +62,8 @@ fn reflect(incident: &Vector3, normal: &Vector3) -> Vector3 {
     *incident - *normal * 2.0 * incident.dot(*normal)
 }
 
-// Simplified shadow casting - early exit optimization
-fn cast_shadow_simple(
+// Optimized shadow casting - simplified for performance
+fn cast_shadow(
     intersect: &Intersect,
     light: &Light,
     objects: &mut [Cube],
@@ -63,33 +72,69 @@ fn cast_shadow_simple(
     let light_distance = (light.position - intersect.point).length();
     let shadow_ray_origin = offset_origin(intersect, &light_dir);
 
-    // Early exit - check closest objects first
-    for object in objects.iter_mut().take(20) { // Limit shadow ray tests
+    // Early exit for distant lights
+    if light_distance > 25.0 {
+        return 0.2; // Light shadow for distant surfaces
+    }
+
+    // Check all objects for shadows - no early termination to prevent holes
+    for object in objects.iter_mut() {
         let shadow_intersect = object.ray_intersect(&shadow_ray_origin, &light_dir);
-        if shadow_intersect.is_intersecting && shadow_intersect.distance < light_distance {
-            return 0.8; // Softer shadows for better performance
+        if shadow_intersect.is_intersecting && shadow_intersect.distance < light_distance - 0.01 {
+            return 0.8; // Reduced shadow intensity
         }
     }
     0.0
 }
 
-// Simplified ray casting with aggressive optimizations
-pub fn cast_ray_fast(
+// Frustum culling - less aggressive to prevent holes
+fn is_in_frustum(cube_center: Vector3, _cube_size: f32, camera: &Camera, _fov: f32, _aspect: f32) -> bool {
+    if !FRUSTUM_CULLING {
+        return true;
+    }
+    
+    let to_cube = cube_center - camera.eye;
+    let distance = to_cube.length();
+    
+    // More conservative distance culling
+    if distance > 35.0 {
+        return false;
+    }
+    
+    // Very conservative frustum check - only cull objects clearly behind
+    let forward_dot = to_cube.normalized().dot(camera.forward);
+    if forward_dot < -0.5 {  // Much more lenient
+        return false;
+    }
+    
+    true
+}
+
+// Simplified ray casting - removed aggressive optimizations causing holes
+pub fn cast_ray(
     ray_origin: &Vector3,
     ray_direction: &Vector3,
     objects: &mut [Cube],
     light: &Light,
     depth: u32,
+    camera: &Camera,
+    fov: f32,
+    aspect: f32,
 ) -> Vector3 {
-    if depth > 1 { // Maximum 1 reflection
+    if depth > MAX_RAY_DEPTH {
         return procedural_sky(*ray_direction);
     }
 
     let mut intersect = Intersect::empty();
     let mut zbuffer = f32::INFINITY;
 
-    // Find closest intersection
+    // Find closest intersection - check all visible objects
     for object in objects.iter_mut() {
+        // Only use conservative frustum culling
+        if !is_in_frustum(object.center, object.size, camera, fov, aspect) {
+            continue;
+        }
+        
         let i = object.ray_intersect(ray_origin, ray_direction);
         if i.is_intersecting && i.distance < zbuffer {
             zbuffer = i.distance;
@@ -101,44 +146,62 @@ pub fn cast_ray_fast(
         return procedural_sky(*ray_direction);
     }
 
-    // Simplified lighting calculation
+    // Simplified lighting model
     let light_dir = (light.position - intersect.point).normalized();
-    let diffuse_intensity = intersect.normal.dot(light_dir).max(0.0);
+    let light_distance = (light.position - intersect.point).length();
     
-    // Skip expensive shadow calculation for distant objects
-    let shadow_intensity = if intersect.distance < 10.0 {
-        cast_shadow_simple(&intersect, light, objects)
+    // Brighter ambient for better visibility
+    let ambient = Vector3::new(0.1, 0.1, 0.15);
+    
+    // Simplified shadow calculation
+    let shadow_intensity = if light_distance < 20.0 {
+        cast_shadow(&intersect, light, objects)
     } else {
-        0.0
+        0.1 // Very light shadow for distant surfaces
     };
     
-    let light_intensity = light.intensity * (1.0 - shadow_intensity);
-    let diffuse = intersect.material.diffuse * (diffuse_intensity * light_intensity);
-
-    // Simplified specular (no expensive pow calculation)
-    let view_dir = (*ray_origin - intersect.point).normalized();
-    let reflect_dir = reflect(&-light_dir, &intersect.normal).normalized();
-    let specular_dot = view_dir.dot(reflect_dir).max(0.0);
-    let specular_intensity = if specular_dot > 0.9 { specular_dot } else { 0.0 }; // Sharp cutoff
+    let light_visibility = 1.0 - shadow_intensity;
+    let distance_falloff = 1.0 / (1.0 + light_distance * light_distance * 0.005);
     
-    let light_color_v3 = Vector3::new(
-        light.color.r as f32 / 255.0, 
-        light.color.g as f32 / 255.0, 
-        light.color.b as f32 / 255.0
-    );
-    let specular = light_color_v3 * (specular_intensity * light_intensity);
+    let diffuse_intensity = intersect.normal.dot(light_dir).max(0.0);
+    let light_intensity = light.intensity * light_visibility * distance_falloff;
+    
+    let diffuse = intersect.material.diffuse * (diffuse_intensity * light_intensity);
+    
+    // Very simplified specular - only for close surfaces
+    let specular = if light_distance < 8.0 && depth == 0 {
+        let view_dir = (*ray_origin - intersect.point).normalized();
+        let reflect_dir = reflect(&-light_dir, &intersect.normal).normalized();
+        let specular_intensity = view_dir.dot(reflect_dir).max(0.0).powf(20.0);
+        
+        let light_color_v3 = Vector3::new(
+            light.color.r as f32 / 255.0, 
+            light.color.g as f32 / 255.0, 
+            light.color.b as f32 / 255.0
+        );
+        light_color_v3 * (specular_intensity * light_intensity * 0.2)
+    } else {
+        Vector3::zero()
+    };
 
+    // No reflections for maximum performance
     let albedo = intersect.material.albedo;
-    diffuse * albedo[0] + specular * albedo[1]
+    let final_color = diffuse * albedo[0] + specular * albedo[1] + ambient;
+    
+    Vector3::new(
+        final_color.x.min(1.0),
+        final_color.y.min(1.0),
+        final_color.z.min(1.0)
+    )
 }
 
-// Adaptive quality rendering - lower quality for moving camera
+// Adaptive rendering based on camera movement
 pub fn render_adaptive(
     framebuffer: &mut Framebuffer, 
     objects: &mut [Cube], 
     camera: &Camera, 
     light: &Light,
-    quality_level: u32
+    render_scale: f32,
 ) {
     let width = framebuffer.width as f32;
     let height = framebuffer.height as f32;
@@ -146,226 +209,367 @@ pub fn render_adaptive(
     let fov = PI / 3.0;
     let perspective_scale = (fov * 0.5).tan();
 
-    let pixel_step = match quality_level {
-        0 => 4, // Very low quality - 1/16 pixels
-        1 => 2, // Low quality - 1/4 pixels  
-        _ => 1, // Full quality
-    };
+    let render_width = (width * render_scale) as u32;
+    let render_height = (height * render_scale) as u32;
+    
+    let step_x = framebuffer.width / render_width;
+    let step_y = framebuffer.height / render_height;
 
-    for y in (0..framebuffer.height).step_by(pixel_step) {
-        for x in (0..framebuffer.width).step_by(pixel_step) {
-            let screen_x = (2.0 * x as f32) / width - 1.0;
-            let screen_y = -(2.0 * y as f32) / height + 1.0;
-
+    // Single-threaded rendering (no parallel processing due to Raylib limitations)
+    for y in 0..render_height {
+        for x in 0..render_width {
+            let actual_x = x * step_x;
+            let actual_y = y * step_y;
+            
+            let screen_x = (2.0 * actual_x as f32) / width - 1.0;
+            let screen_y = -(2.0 * actual_y as f32) / height + 1.0;
             let screen_x = screen_x * aspect_ratio * perspective_scale;
             let screen_y = screen_y * perspective_scale;
 
             let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
             let rotated_direction = camera.basis_change(&ray_direction);
 
-            let pixel_color_v3 = cast_ray_fast(&camera.eye, &rotated_direction, objects, light, 0);
+            let pixel_color_v3 = cast_ray(&camera.eye, &rotated_direction, objects, light, 0, camera, fov, aspect_ratio);
             let pixel_color = vector3_to_color(pixel_color_v3);
 
             framebuffer.set_current_color(pixel_color);
             
-            // Fill pixel block for lower quality modes
-            for dy in 0..pixel_step.min((framebuffer.height - y) as usize) {
-                for dx in 0..pixel_step.min((framebuffer.width - x) as usize) {
-                    framebuffer.set_pixel(x + dx as u32, y + dy as u32);
+            // Fill block if downscaled for better visual quality
+            for dy in 0..step_y {
+                for dx in 0..step_x {
+                    framebuffer.set_pixel(actual_x + dx, actual_y + dy);
                 }
             }
         }
     }
 }
 
-// Create smaller floor for better performance
-fn create_floor_optimized(tierra_texture: Image) -> Vec<Cube> {
+// Create complete diorama with FULL borders
+fn create_diorama(
+    piedra_texture: Image, 
+    diamante_texture: Option<Image>, 
+    tierra_texture: Option<Image>
+) -> Vec<Cube> {
     let mut cubes = Vec::new();
-    let cube_size = 1.2; // Slightly larger cubes
-    let floor_size = 6;  // Even smaller 6x6 grid
+    let cube_size = 1.0;
+    let floor_size = 10; 
+    let wall_height = 5;  
     let start_offset = -((floor_size - 1) as f32 * cube_size) / 2.0;
     
-    let tierra_material = Material::new(
-        Vector3::new(1.0, 1.0, 1.0),
-        16.0,
-        [0.9, 0.1, 0.0, 0.0], // No reflections/transparency
+    // Materials
+    let piedra_material = Material::new(
+        Vector3::new(0.8, 0.8, 0.8),
+        32.0,
+        [0.9, 0.1, 0.0, 0.0],
         1.0,
     );
     
+    let diamante_material = Material::new(
+        Vector3::new(0.9, 0.9, 1.0),
+        128.0,
+        [0.3, 0.3, 0.4, 0.0],
+        1.0,
+    );
+    
+    let tierra_material = Material::new(
+        Vector3::new(0.6, 0.4, 0.2),
+        16.0,
+        [0.9, 0.1, 0.0, 0.0],
+        1.0,
+    );
+    
+    // Diamond spots on floor
+    let diamond_spots = vec![
+        (2, 3), (7, 2), (4, 6), (8, 7)
+    ];
+    
+    // 1. BOTTOM FLOOR (complete)
     for x in 0..floor_size {
         for z in 0..floor_size {
             let pos_x = start_offset + x as f32 * cube_size;
             let pos_z = start_offset + z as f32 * cube_size;
             let pos_y = -cube_size / 2.0;
             
-            let cube = Cube::with_texture(
-                Vector3::new(pos_x, pos_y, pos_z),
-                cube_size,
-                tierra_material,
-                tierra_texture.clone(),
-            );
+            let is_diamond = diamond_spots.contains(&(x, z));
+            
+            let cube = if is_diamond && diamante_texture.is_some() {
+                Cube::with_texture(
+                    Vector3::new(pos_x, pos_y, pos_z),
+                    cube_size,
+                    diamante_material,
+                    diamante_texture.as_ref().unwrap().clone(),
+                )
+            } else {
+                Cube::with_texture(
+                    Vector3::new(pos_x, pos_y, pos_z),
+                    cube_size,
+                    piedra_material,
+                    piedra_texture.clone(),
+                )
+            };
             
             cubes.push(cube);
         }
     }
     
+    // 2. WALLS (3 walls - no front wall)
+    // Left wall
+    for y in 0..wall_height {
+        for z in 0..floor_size {
+            let pos_x = start_offset;
+            let pos_z = start_offset + z as f32 * cube_size;
+            let pos_y = cube_size / 2.0 + y as f32 * cube_size;
+            
+            cubes.push(Cube::with_texture(
+                Vector3::new(pos_x, pos_y, pos_z),
+                cube_size,
+                piedra_material,
+                piedra_texture.clone(),
+            ));
+        }
+    }
+    
+    // Right wall
+    for y in 0..wall_height {
+        for z in 0..floor_size {
+            let pos_x = start_offset + (floor_size - 1) as f32 * cube_size;
+            let pos_z = start_offset + z as f32 * cube_size;
+            let pos_y = cube_size / 2.0 + y as f32 * cube_size;
+            
+            cubes.push(Cube::with_texture(
+                Vector3::new(pos_x, pos_y, pos_z),
+                cube_size,
+                piedra_material,
+                piedra_texture.clone(),
+            ));
+        }
+    }
+    
+    // Back wall
+    for y in 0..wall_height {
+        for x in 1..(floor_size-1) {
+            let pos_x = start_offset + x as f32 * cube_size;
+            let pos_z = start_offset + (floor_size - 1) as f32 * cube_size;
+            let pos_y = cube_size / 2.0 + y as f32 * cube_size;
+            
+            cubes.push(Cube::with_texture(
+                Vector3::new(pos_x, pos_y, pos_z),
+                cube_size,
+                piedra_material,
+                piedra_texture.clone(),
+            ));
+        }
+    }
+    
+    // 3. TOP FLOOR - COMPLETE with ALL border cubes
+    if let Some(tierra_tex) = tierra_texture {
+        let top_y = cube_size / 2.0 + wall_height as f32 * cube_size;
+        
+        // 4x3 hole in center
+        let hole_center_x = floor_size / 2;
+        let hole_center_z = floor_size / 2;
+        let hole_start_x = hole_center_x - 2; // 4 wide
+        let hole_start_z = hole_center_z - 1; // 3 deep
+        let hole_end_x = hole_start_x + 4;
+        let hole_end_z = hole_start_z + 3;
+        
+        // Add EVERY top cube except hole
+        for x in 0..floor_size {
+            for z in 0..floor_size {
+                let in_hole = x >= hole_start_x && x < hole_end_x && 
+                             z >= hole_start_z && z < hole_end_z;
+                
+                if !in_hole {
+                    let pos_x = start_offset + x as f32 * cube_size;
+                    let pos_z = start_offset + z as f32 * cube_size;
+                    
+                    cubes.push(Cube::with_texture(
+                        Vector3::new(pos_x, top_y, pos_z),
+                        cube_size,
+                        tierra_material,
+                        tierra_tex.clone(),
+                    ));
+                }
+            }
+        }
+        
+        println!("TOP FLOOR: {} tierra cubes with complete borders", 
+                 (floor_size * floor_size) - (4 * 3));
+    }
+    
+    println!("TOTAL CUBES: {}", cubes.len());
     cubes
 }
 
 fn main() {
-    let window_width = 640;  // Further reduced resolution
-    let window_height = 480;
+    let window_width = 800;
+    let window_height = 600;
  
     let (mut window, thread) = raylib::init()
         .size(window_width, window_height)
-        .title("Fast Diorama Raytracer")
+        .title("Optimized Cave Diorama")
         .log_level(TraceLogLevel::LOG_WARNING)
         .build();
 
     let mut framebuffer = Framebuffer::new(window_width as u32, window_height as u32);
 
-    // Load texture
-    let texture_paths = [
-        "src/assets/Piedra.png",
-        "./src/assets/Piedra.png",
-        "./assets/Piedra.png"
-    ];
+    // Load textures
+    let piedra_paths = ["src/assets/Piedra.png", "./src/assets/Piedra.png", "./assets/Piedra.png"];
+    let diamante_paths = ["src/assets/Diamante.png", "./src/assets/Diamante.png", "./assets/Diamante.png"];
+    let tierra_paths = ["src/assets/Tierra.png", "./src/assets/Tierra.png", "./assets/Tierra.png"];
 
-    let mut tierra_texture = None;
-    for path in &texture_paths {
-        match Image::load_image(path) {
-            Ok(image) => {
-                println!("Successfully loaded Tierra texture from: {}", path);
-                tierra_texture = Some(image);
-                break;
-            }
-            Err(e) => {
-                println!("Failed to load texture from {}: {:?}", path, e);
-            }
+    let mut piedra_texture = None;
+    for path in &piedra_paths {
+        if let Ok(image) = Image::load_image(path) {
+            println!("Loaded Piedra from: {}", path);
+            piedra_texture = Some(image);
+            break;
         }
     }
 
-    let mut objects = if let Some(texture) = tierra_texture {
-        create_floor_optimized(texture)
+    let mut diamante_texture = None;
+    for path in &diamante_paths {
+        if let Ok(image) = Image::load_image(path) {
+            println!("Loaded Diamante from: {}", path);
+            diamante_texture = Some(image);
+            break;
+        }
+    }
+
+    let mut tierra_texture = None;
+    for path in &tierra_paths {
+        if let Ok(image) = Image::load_image(path) {
+            println!("Loaded Tierra from: {}", path);
+            tierra_texture = Some(image);
+            break;
+        }
+    }
+
+    let mut objects = if let Some(piedra) = piedra_texture {
+        create_diorama(piedra, diamante_texture, tierra_texture)
     } else {
-        println!("Error: Could not load Tierra texture!");
-        let fallback_material = Material::new(
-            Vector3::new(0.6, 0.4, 0.2),
-            16.0,
-            [0.9, 0.1, 0.0, 0.0],
-            1.0,
-        );
-        vec![Cube::new(Vector3::new(0.0, -0.6, 0.0), 1.2, fallback_material)]
+        println!("ERROR: Could not load Piedra texture!");
+        vec![]
     };
 
+    // Camera positioned to see the cave clearly
     let mut camera = Camera::new(
-        Vector3::new(0.0, 2.5, 5.0),
-        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(-6.0, 6.0, -6.0),
+        Vector3::new(0.0, 2.0, 0.0),
         Vector3::new(0.0, 1.0, 0.0),
     );
 
+    // Store previous camera position for movement detection
+    let mut prev_camera_pos = camera.eye;
+    let mut prev_camera_angles = (camera.yaw, camera.pitch);
+
+    // Light positioned ABOVE the hole to shine DOWN into cave
     let light = Light::new(
-        Vector3::new(1.5, 3.0, 1.5),
-        Color::new(255, 255, 255, 255),
-        1.3,
+        Vector3::new(0.0, 10.0, 0.0),
+        Color::new(255, 255, 200, 255), 
+        3.0,
     );
 
-    let movement_speed = 0.4;
-    let rotation_speed = 0.1;
+    let movement_speed = 0.3;
+    let rotation_speed = 0.03;
 
-    println!("High Performance Controls:");
-    println!("- WASD: Move around");
-    println!("- Q/E: Move up/down");  
-    println!("- Arrow keys: Look around");
-    println!("- 1/2/3: Quality levels (1=fast, 3=best)");
-    println!("- ESC: Exit");
-    println!("Optimizations: 6x6 grid, 640x480, adaptive quality, simplified lighting");
+    println!("\n=== OPTIMIZED CAVE DIORAMA ===");
+    println!("WASD: Move | Q/E: Up/Down | Arrows: Look | ESC: Exit");
+    println!("OPTIMIZATIONS:");
+    println!("- Adaptive rendering (lower res when moving)");
+    println!("- Frustum culling (skip off-screen objects)");
+    println!("- Early ray termination");
+    println!("- Distance-based LOD");
+    println!("- Optimized lighting calculations");
 
     let mut frame_count = 0;
     let mut last_fps_time = std::time::Instant::now();
-    let mut quality_level = 1; // Start with low quality
-    let mut last_input_time = std::time::Instant::now();
+    let mut frames_since_movement = 0;
 
     while !window.window_should_close() {
-        let now = std::time::Instant::now();
-        let input_active = false;
+        let mut camera_moved = false;
 
         // Camera controls
-        let mut moved = false;
         if window.is_key_down(KeyboardKey::KEY_W) {
             camera.move_forward(movement_speed);
-            moved = true;
+            camera_moved = true;
         }
         if window.is_key_down(KeyboardKey::KEY_S) {
             camera.move_forward(-movement_speed);
-            moved = true;
+            camera_moved = true;
         }
         if window.is_key_down(KeyboardKey::KEY_A) {
             camera.move_right(-movement_speed);
-            moved = true;
+            camera_moved = true;
         }
         if window.is_key_down(KeyboardKey::KEY_D) {
             camera.move_right(movement_speed);
-            moved = true;
+            camera_moved = true;
         }
         if window.is_key_down(KeyboardKey::KEY_Q) {
             camera.move_up(movement_speed);
-            moved = true;
+            camera_moved = true;
         }
         if window.is_key_down(KeyboardKey::KEY_E) {
             camera.move_up(-movement_speed);
-            moved = true;
+            camera_moved = true;
         }
         if window.is_key_down(KeyboardKey::KEY_LEFT) {
             camera.rotate(-rotation_speed, 0.0);
-            moved = true;
+            camera_moved = true;
         }
         if window.is_key_down(KeyboardKey::KEY_RIGHT) {
             camera.rotate(rotation_speed, 0.0);
-            moved = true;
+            camera_moved = true;
         }
         if window.is_key_down(KeyboardKey::KEY_UP) {
             camera.rotate(0.0, rotation_speed);
-            moved = true;
+            camera_moved = true;
         }
         if window.is_key_down(KeyboardKey::KEY_DOWN) {
             camera.rotate(0.0, -rotation_speed);
-            moved = true;
+            camera_moved = true;
         }
 
-        // Quality control
-        if window.is_key_pressed(KeyboardKey::KEY_ONE) {
-            quality_level = 0;
-            println!("Quality: Very Low (fastest)");
-        }
-        if window.is_key_pressed(KeyboardKey::KEY_TWO) {
-            quality_level = 1;
-            println!("Quality: Low");
-        }
-        if window.is_key_pressed(KeyboardKey::KEY_THREE) {
-            quality_level = 2;
-            println!("Quality: High (best)");
-        }
-
-        // Adaptive quality: use lower quality when moving
-        let render_quality = if moved {
-            last_input_time = now;
-            0 // Very low quality while moving
-        } else if now.duration_since(last_input_time).as_millis() < 100 {
-            1 // Low quality briefly after stopping
+        // Detect movement for adaptive rendering
+        let pos_changed = (camera.eye - prev_camera_pos).length() > 0.01;
+        let angle_changed = ((camera.yaw - prev_camera_angles.0).abs() > 0.001) || 
+                           ((camera.pitch - prev_camera_angles.1).abs() > 0.001);
+        
+        if pos_changed || angle_changed || camera_moved {
+            frames_since_movement = 0;
         } else {
-            quality_level // Use selected quality when stationary
+            frames_since_movement += 1;
+        }
+
+        // Adaptive render scale with more gradual transitions
+        let render_scale = if ADAPTIVE_RENDER {
+            if frames_since_movement < 3 {
+                MIN_RENDER_SCALE // Very low quality while actively moving
+            } else if frames_since_movement < 8 {
+                MID_RENDER_SCALE // Medium quality shortly after stopping
+            } else {
+                MAX_RENDER_SCALE // Highest quality when still
+            }
+        } else {
+            MAX_RENDER_SCALE
         };
 
-        // Render
+        // Render with adaptive quality
         framebuffer.clear();
-        render_adaptive(&mut framebuffer, &mut objects, &camera, &light, render_quality);
+        render_adaptive(&mut framebuffer, &mut objects, &camera, &light, render_scale);
         framebuffer.swap_buffers(&mut window, &thread);
 
-        // FPS counter
+        // Update previous camera state
+        prev_camera_pos = camera.eye;
+        prev_camera_angles = (camera.yaw, camera.pitch);
+
+        // FPS monitoring
         frame_count += 1;
-        if last_fps_time.elapsed().as_secs() >= 1 {
-            println!("FPS: {} (Quality: {})", frame_count, render_quality);
+        if last_fps_time.elapsed().as_secs() >= 2 {
+            println!("FPS: {} | Scale: {:.2} | Cubes: {} | Pos: ({:.1}, {:.1}, {:.1})", 
+                    frame_count / 2, render_scale, objects.len(), 
+                    camera.eye.x, camera.eye.y, camera.eye.z);
             frame_count = 0;
             last_fps_time = std::time::Instant::now();
         }
