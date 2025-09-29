@@ -17,12 +17,12 @@ use material::{Material, vector3_to_color};
 
 const ORIGIN_BIAS: f32 = 1e-4;
 
-// Performance settings - adjusted for better balance
+// Performance settings - adjusted for reflections
 const ADAPTIVE_RENDER: bool = true;
 const MIN_RENDER_SCALE: f32 = 0.125; // Even lower for moving
 const MID_RENDER_SCALE: f32 = 0.5;   // Medium quality
 const MAX_RENDER_SCALE: f32 = 0.75;  // Reduced max quality
-const MAX_RAY_DEPTH: u32 = 0;        // No reflections for performance
+const MAX_RAY_DEPTH: u32 = 2;        // Enable reflections (was 0)
 const FRUSTUM_CULLING: bool = true;
 const EARLY_RAY_TERMINATION: bool = false; // Disabled - causing holes
 
@@ -110,7 +110,7 @@ fn is_in_frustum(cube_center: Vector3, _cube_size: f32, camera: &Camera, _fov: f
     true
 }
 
-// Simplified ray casting - removed aggressive optimizations causing holes
+// Enhanced ray casting with reflections and transparency
 pub fn cast_ray(
     ray_origin: &Vector3,
     ray_direction: &Vector3,
@@ -184,9 +184,24 @@ pub fn cast_ray(
         Vector3::zero()
     };
 
-    // No reflections for maximum performance
+    // Reflections for reflective materials (diamonds)
+    let mut reflection_color = Vector3::zero();
+    if intersect.material.albedo[2] > 0.0 && depth < MAX_RAY_DEPTH {
+        let reflect_dir = reflect(ray_direction, &intersect.normal).normalized();
+        let reflect_origin = offset_origin(&intersect, &reflect_dir);
+        reflection_color = cast_ray(&reflect_origin, &reflect_dir, objects, light, depth + 1, camera, fov, aspect);
+    }
+
+    // Refraction/transparency for transparent materials (leaves)
+    let mut refract_color = Vector3::zero();
+    if intersect.material.albedo[3] > 0.0 && depth < MAX_RAY_DEPTH {
+        // Simple transparency - just continue the ray through the object
+        let refract_origin = offset_origin(&intersect, ray_direction);
+        refract_color = cast_ray(&refract_origin, ray_direction, objects, light, depth + 1, camera, fov, aspect);
+    }
+
     let albedo = intersect.material.albedo;
-    let final_color = diffuse * albedo[0] + specular * albedo[1] + ambient;
+    let final_color = diffuse * albedo[0] + specular * albedo[1] + reflection_color * albedo[2] + refract_color * albedo[3] + ambient;
     
     Vector3::new(
         final_color.x.min(1.0),
@@ -341,19 +356,20 @@ fn create_diorama(
     let wall_height = 5;  
     let start_offset = -((floor_size - 1) as f32 * cube_size) / 2.0;
     
-    // Materials
+    // Materials with special properties
     let piedra_material = Material::new(
         Vector3::new(0.8, 0.8, 0.8),
         32.0,
-        [0.9, 0.1, 0.0, 0.0],
+        [0.9, 0.1, 0.0, 0.0],  // diffuse, specular, reflection, transparency
         1.0,
     );
     
+    // Diamond material - highly reflective and shiny
     let diamante_material = Material::new(
         Vector3::new(0.9, 0.9, 1.0),
         128.0,
-        [0.3, 0.3, 0.4, 0.0],
-        1.0,
+        [0.2, 0.3, 0.5, 0.0],  // Less diffuse, more reflection (50%)
+        2.42,  // Diamond refractive index
     );
     
     let tierra_material = Material::new(
@@ -370,10 +386,11 @@ fn create_diorama(
         1.0,
     );
 
+    // Leaves material - semi-transparent to let light through
     let hojas_material = Material::new(
         Vector3::new(0.2, 0.7, 0.2),
         8.0,
-        [0.8, 0.2, 0.0, 0.0],
+        [0.6, 0.1, 0.0, 0.3],  // 30% transparent to simulate leaves
         1.0,
     );
     
